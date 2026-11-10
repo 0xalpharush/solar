@@ -158,13 +158,17 @@ def main():
         for file in report["files"]:
             for rule in file["rules"]:
                 if rule["status"] != "proved":
-                    reason = rule.get("error") or next(
-                        (
-                            p.get("reason") or p.get("output", "")[-300:]
-                            for p in rule.get("proofs", [])
-                            if p.get("status") != "proved"
-                        ),
-                        "",
+                    reason = (
+                        rule.get("error")
+                        or rule.get("excluded")
+                        or next(
+                            (
+                                p.get("reason") or p.get("output", "")[-300:]
+                                for p in rule.get("proofs", [])
+                                if p.get("status") != "proved"
+                            ),
+                            "",
+                        )
                     )
                     source = rule.get("source", file["source"])
                     width = (
@@ -175,7 +179,12 @@ def main():
                         file=sys.stderr,
                     )
         counts = report["counts"]
-        exit_code = 0 if counts.get("proved", 0) and set(counts) == {"proved"} else 1
+        # Excluded rules stay reported, but only the listed ones may go unproved.
+        exit_code = (
+            0
+            if counts.get("proved", 0) and set(counts) <= {"proved", "excluded"}
+            else 1
+        )
     implementation = sorted((Path(__file__).parent / "evm_rules").glob("*.py")) + [
         Path(__file__)
     ]

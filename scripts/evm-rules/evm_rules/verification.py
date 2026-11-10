@@ -23,7 +23,8 @@ from queue import SimpleQueue
 from .expr import Expr, Unsupported
 from .isle import ISLE, Context, Rule, forms, rule_sources
 from .late import late_obligation, late_rules
-from .lean import canonical, simplify
+from .lean import MEMORY, canonical, simplify
+from .peephole import EXCLUDED, peephole_rules, peephole_theorems, peephole_variants
 from .prover import MANUAL_PROOFS, Checker, job, prove
 from .stack import stack_rules, stack_variants
 
@@ -32,6 +33,7 @@ DEFAULT_FILES = [
     ISLE / "mir/word_sequence",
     ISLE / "evm-ir/stack_peephole.isle",
     ISLE / "evm-ir/late_word.isle",
+    ISLE / "evm-ir/peephole.isle",
     ISLE / "mir/egraph",
 ]
 # These prefixes are the shared scalar rules covered by the native-width model.
@@ -80,6 +82,26 @@ def obligations(path):
                     (f"{entry['name']}_{index}", shape, Expr.const(0), [])
                     for index, shape in enumerate(shapes)
                 ]
+            except FAILURES as error:
+                entry["error"] = str(error)
+            yield entry
+        return
+    if path.name == "peephole.isle":
+        _, rules = peephole_rules(path)
+        for rule in rules:
+            entry = {
+                "line": rule.line,
+                "name": f"{path.stem}_L{rule.line}",
+                "sha256": rule.digest,
+            }
+            if reason := EXCLUDED.get(rule.digest):
+                entry["excluded"] = reason
+                yield entry
+                continue
+            try:
+                variants = peephole_variants(rule)
+                entry["variants"] = len(variants)
+                entry["theorems"] = peephole_theorems(entry["name"], variants)
             except FAILURES as error:
                 entry["error"] = str(error)
             yield entry
@@ -157,7 +179,7 @@ def verify_files(
     manual = {path.stem: path.read_text() for path in MANUAL_PROOFS.glob("*.lean")}
     files, tasks, proofs = [], [], {}
     # A proof for a selected file must name one of its current rules.
-    stems = {path.stem for path in paths}
+    stems = {path.stem for path in paths if path.resolve().is_relative_to(ISLE)}
     unused = {
         name
         for name in manual
@@ -183,6 +205,11 @@ def verify_files(
                 unused.discard(key)
                 proof = manual.get(key)
                 automatic = tactic
+                if any(
+                    name.startswith(MEMORY)
+                    for name in lhs.variables() | rhs.variables()
+                ):
+                    automatic = f"evm_memory {timeout_s}"
                 if bits := entry.get("integer_bits"):
                     automatic = (
                         "first | (evm_unfold; (try simp only [BitVec.zero_and, BitVec.zero_sub]); "
@@ -245,7 +272,9 @@ def verify_files(
     for file in files:
         for entry in file["rules"]:
             theorems = [proofs.get(name, {}) for name, *_ in entry.pop("theorems", [])]
-            if "error" in entry:
+            if "excluded" in entry:
+                entry["status"] = "excluded"
+            elif "error" in entry:
                 entry["status"] = "unsupported"
             else:
                 entry["status"] = next(

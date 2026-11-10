@@ -90,6 +90,9 @@ def concrete(expr, values, environment=None):
         return values[expr.args[0]] & MASK
     if expr.op == "const":
         return expr.args[0]
+    if expr.op in ("mload", "mstore"):
+        # Memory contents are proved in Lean only; their counterexamples are not replayed.
+        raise Unsupported("memory has no integer semantics")
     args = tuple(concrete(a, values, environment) for a in expr.args)
     if expr.op in ("address", "selfbalance", "balance"):
         if environment is None or len(args) != (1 if expr.op == "balance" else 0):

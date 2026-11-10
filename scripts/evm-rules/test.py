@@ -43,6 +43,8 @@ from evm_rules.lean import (
     theorem,
 )
 from evm_rules.mining import abstract_patterns, mine
+from evm_rules.peephole import EXCLUDED as PEEPHOLE_EXCLUDED
+from evm_rules.peephole import opcode_classes, peephole_variants
 from evm_rules.prover import (
     LEAN_PROJECT,
     MANUAL_PROOFS,
@@ -424,6 +426,139 @@ class LateWordProofTests(unittest.TestCase):
             self.assertTrue(
                 any(r["status"] == "unsupported" for r in self.verify(change)["rules"])
             )
+
+
+class PeepholeProofTests(unittest.TestCase):
+    def verify(self, source):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "peephole.isle"
+            path.write_text(source)
+            return verify_rules(path)
+
+    def rule(self, source):
+        (form, line), *_ = forms(source)
+        return Rule(form, line, "peephole.isle")
+
+    def test_compiled_peephole_rules(self):
+        report = verify_rules(ISLE / "evm-ir/peephole.isle")
+        statuses = [r["status"] for r in report["rules"]]
+        self.assertEqual(len(statuses), 37)
+        self.assertEqual(statuses.count("excluded"), len(PEEPHOLE_EXCLUDED))
+        self.assertEqual(statuses.count("proved"), 37 - len(PEEPHOLE_EXCLUDED))
+        excluded = {r["sha256"] for r in report["rules"] if r["status"] == "excluded"}
+        self.assertEqual(excluded, set(PEEPHOLE_EXCLUDED))
+        self.assertGreater(sum(r.get("variants", 0) for r in report["rules"]), 6000)
+
+    def test_opcode_classes_follow_the_opcode_table(self):
+        classes = opcode_classes()
+        self.assertEqual(
+            classes["is_sink"], {"MSTORE", "MSTORE8", "SSTORE", "TSTORE", "LOG0"}
+        )
+        self.assertEqual(
+            classes["absorbs_zero"], {"MUL", "DIV", "SDIV", "MOD", "SMOD", "AND", "GT"}
+        )
+        self.assertIn("ADDMOD", classes["is_commutative"])
+        self.assertNotIn("ADDMOD", classes["is_commutative_binop"])
+        self.assertIn("KECCAK256", classes["is_noncommutative_binop"])
+        self.assertNotIn("KECCAK256", classes["is_pure_binop"])
+
+    def test_wrong_rules_have_replayed_counterexamples(self):
+        for source in (
+            # SWAP1 LT is GT, not LT.
+            (
+                "(rule 210 (peep_op (last2 (opcode $SWAP1) (opcode comparison)))"
+                " (if-let flipped (flipped_comparison comparison))"
+                " (rewrite 2 (Edit.RemoveFirstOverwrite comparison)))"
+            ),
+            # 0 > x never holds, so its negation is not x == 0.
+            (
+                "(rule 230 (peep_op (last3 (push zero) (opcode $GT) (opcode $ISZERO)))"
+                " (if-let true (u256_is_zero zero)) (rewrite 3 (Edit.ZeroLessIszero)))"
+            ),
+            # 0 > x never jumps, where x does whenever it is nonzero.
+            (
+                "(rule 109 (peep_op (unprotected_last4 (push zero) (opcode $GT) (push_block)"
+                " (opcode $JUMPI))) (if-let true (u256_is_zero zero))"
+                " (rewrite 4 (Edit.DropNonzeroTest)))"
+            ),
+            # A jump on one is always taken.
+            (
+                "(rule 1 (peep_op (last3 (push one) (push_block) (opcode $JUMPI)))"
+                " (if-let true (u256_is_one one)) (rewrite 3 (Edit.Keep 0)))"
+            ),
+        ):
+            with self.subTest(source=source):
+                result = self.verify(source)["rules"][0]
+                self.assertEqual(result["status"], "counterexample")
+                # Each opcode instance fails on its own.
+                proofs = result.get("proofs") or [result]
+                self.assertTrue(all(p["status"] == "counterexample" for p in proofs))
+                self.assertTrue(all(p["replayed"] for p in proofs))
+
+    def test_memory_rules_need_the_same_address(self):
+        source = next(
+            repr_rule(form)
+            for form, _ in forms((ISLE / "evm-ir/peephole.isle").read_text())
+            if form[0] == "rule" and form[1] == "140"
+        )
+        self.assertEqual(self.verify(source)["rules"][0]["status"], "proved")
+        # Reloading another address, or dropping a store, changes memory or the word.
+        for wrong in (
+            source.replace("(opcode $POP) (push a)", "(opcode $POP) (push b)"),
+            (
+                "(rule (peep_op (last3 (any_push) (any_push) (opcode $MSTORE)))"
+                " (rewrite 3 (Edit.Keep 0)))"
+            ),
+        ):
+            with self.subTest(source=wrong):
+                result = self.verify(wrong)["rules"][0]
+                self.assertNotEqual(result["status"], "proved")
+
+    def test_unmodeled_terms_and_shapes_fail_closed(self):
+        for source in (
+            "(rule (peep_pop (last2 (any_push) (opcode $POP))) (rewrite 2 (Edit.Unknown)))",
+            "(rule (peep_pop (last2 (any_push) (opcode $POP))) (rewrite 3 (Edit.Keep 0)))",
+            "(rule (peep_op (last2 (any_push) (opcode $POP))) (rewrite 2 (Edit.Keep 0)))",
+            "(rule (peep_op (unknown_window len)) (rewrite len (Edit.Keep 0)))",
+            (
+                "(rule (peep_op (last2 (push x) (opcode $OR))) (if-let true (unknown x))"
+                " (rewrite 2 (Edit.Keep 0)))"
+            ),
+            # Effects may not move or disappear.
+            (
+                "(rule (peep_op (last3 (any_push) (any_push) (opcode $SSTORE)))"
+                " (rewrite 3 (Edit.Keep 0)))"
+            ),
+            "(rule (peep_op (last2 (any_push) (opcode $JUMP))) (rewrite 2 (Edit.Keep 1)))",
+        ):
+            with self.subTest(source=source):
+                self.assertEqual(
+                    self.verify(source)["rules"][0]["status"], "unsupported"
+                )
+
+    def test_stack_peak_growth_is_rejected(self):
+        # PUSH x MSTORE PUSH x MLOAD => DUP1 PUSH x MSTORE holds two words at once.
+        rule = self.rule(
+            "(rule 130 (peep_op (last4 (push a) (opcode $MSTORE) (push a)"
+            " (opcode $MLOAD))) (rewrite 4 (Edit.ReloadStoredValue)))"
+        )
+        self.assertIn(rule.digest, PEEPHOLE_EXCLUDED)
+        with self.assertRaisesRegex(Unsupported, "grows higher"):
+            peephole_variants(rule)
+
+    def test_comparison_inversion_needs_its_bound_check(self):
+        # Without the wrap check, x <= MAX would become x < MAX + 1, which is x < 0.
+        variants = peephole_variants(
+            self.rule(
+                "(rule 225 (peep_op (invert_comparison count value opcode))"
+                " (rewrite count (Edit.InvertComparison value opcode)))"
+            )
+        )
+        self.assertEqual(len(variants), 8)
+        self.assertTrue(all(len(v["assumptions"]) == 1 for v in variants))
+        results = check_all([(v["difference"], Expr.const(0), []) for v in variants])
+        self.assertTrue(all(r["status"] == "counterexample" for r in results), results)
+        self.assertTrue(all(r["replayed"] for r in results))
 
 
 class SemanticsTests(unittest.TestCase):
@@ -831,7 +966,16 @@ class RuleTests(unittest.TestCase):
                 )
                 skipped = [entry["name"] for entry in entries if "error" in entry]
                 self.assertEqual(skipped, [])
-                self.assertTrue(all(entry.get("theorems") for entry in entries))
+                # Only the listed rules are excluded, and they have no theorem.
+                checked = [entry for entry in entries if "excluded" not in entry]
+                self.assertTrue(all(entry.get("theorems") for entry in checked))
+                self.assertTrue(
+                    all(
+                        PEEPHOLE_EXCLUDED.get(entry["sha256"]) == entry["excluded"]
+                        for entry in entries
+                        if "excluded" in entry
+                    )
+                )
 
     def test_reserved_variable_names_fail_closed(self):
         # Names starting with `@` belong to the checker; a rule cannot bind one.

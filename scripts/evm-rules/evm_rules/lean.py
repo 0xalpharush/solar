@@ -55,6 +55,8 @@ OPERATIONS = {
 }
 ADDRESS = "@environment:address"
 BALANCES = "@environment:balances"
+# Memory states: the entry contents, and the contents after each opaque effect.
+MEMORY = "@memory"
 KEYWORDS = {
     "at",
     "by",
@@ -108,6 +110,10 @@ def term(expr):
             return f"(Evm.balance {lean_name(BALANCES)} {term(account)})"
         case "selfbalance", ():
             return f"(Evm.selfbalance {lean_name(BALANCES)} {lean_name(ADDRESS)})"
+        case "mload", (memory, address):
+            return f"(Evm.mload {term(memory)} {term(address)})"
+        case "mstore", (memory, address, value):
+            return f"(Evm.mstore {term(memory)} {term(address)} {term(value)})"
         case op, args if OPERATIONS.get(op) == len(args):
             return f"(Evm.{op} {' '.join(term(arg) for arg in args)})"
     raise Unsupported(f"no Lean semantics for {expr.op}/{len(expr.args)}")
@@ -203,7 +209,8 @@ def word_variables(item, found):
         return found
     match item.op:
         case "var":
-            found.setdefault(item.args[0], "Word")
+            name = item.args[0]
+            found.setdefault(name, "Memory" if name.startswith(MEMORY) else "Word")
         case "address":
             found.setdefault(ADDRESS, "BitVec 160")
         case "balance":
@@ -289,8 +296,10 @@ def witness(output, variables):
 
 
 def canonical(expr, names=None):
-    """Rename variables in first-use order, so equal shapes share one theorem."""
+    """Rename word variables in first-use order, so equal shapes share one theorem."""
     names = {} if names is None else names
+    if expr.op == "var" and expr.args[0].startswith(MEMORY):
+        return expr
     if expr.op == "var":
         return Expr.var(names.setdefault(expr.args[0], f"s{len(names)}"))
     if expr.op == "const":

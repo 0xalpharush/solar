@@ -3,7 +3,8 @@
 This is an offline search and verification lane for the **actual ISLE source
 compiled into the optimizer**. Under `crates/codegen/isle/`, it checks MIR
 rewrites in `mir/word`, `mir/word_sequence` and `mir/egraph`, and physical EVM
-IR rules in `evm-ir/stack_peephole.isle` and `evm-ir/late_word.isle`. Each rule becomes a
+IR rules in `evm-ir/stack_peephole.isle`, `evm-ir/late_word.isle` and
+`evm-ir/peephole.isle`. Each rule becomes a
 theorem about EVM semantics written in Lean 4, and Lean proves it; no SMT
 solver takes part. The compiler itself has no prover dependency.
 
@@ -316,8 +317,8 @@ Malformed input bytecode and out-of-gas behavior are excluded. The Rust window
 facets, edits and target lowering remain trusted and are recorded by hash.
 The guarded five-op window rejects protected instruction boundaries; focused
 window-helper tests check this guard.
-Other peepholes, especially memory and branch rewrites, are not covered by this
-lane. Unknown syntax, guards, edits or operations fail verification.
+The memory and branch peepholes are checked by the peephole lane below. Unknown
+syntax, guards, edits or operations fail verification.
 
 The late word lane models bounded physical windows around shift-count
 computations. One extractor requires a closed computation that leaves exactly
@@ -341,6 +342,39 @@ one gas on PUSH0 targets. The protected-base form also removes a trailing
 three gas on earlier shift-capable targets. The closed form stays unchanged on
 pre-PUSH0 targets because neither target cost improves. Earlier sharing
 decisions remain unchanged in both cases.
+
+## Peephole rules
+
+`evm-ir/peephole.isle` is checked by `evm_rules/peephole.py`, following
+[Crocus](https://doi.org/10.1145/3617232.3624862) (VanHattum et al., ASPLOS 2024): every
+ISLE term a rule uses gets a specification, each rule is instantiated at every opcode,
+depth and length the specifications admit, and Lean proves each instance's two windows
+equal. Window extractors bind the block's last instructions; `push` binds a literal
+word, `any_push` and `push_block` push arbitrary words, and the stack facets bind every
+legal depth. Opcode classes come from the opcode table in `crates/evmir/src/op.rs`; the
+reader compares each class's Rust body in `peephole/isle.rs` with its transcription and
+fails on any change. Variable-length extractors become families: `swap_pop_chain` and
+`swap_discard_chain` at every swap depth, `fold_constants` at every opcode the evaluator
+folds, and `invert_comparison` at each comparison with its bound on either side, where the
+operands between the push and the comparison may move the bound but never read it. Edits
+transcribe `Edit::apply`.
+
+Execution covers the stack, memory and effects. `lean/EvmRules/Memory.lean` models memory
+as bytes, with `MSTORE` and `MLOAD` big-endian, and proves the three identities the rules need
+over one address; `evm_memory` rewrites with them before `evm_auto`. `JUMPI` records its
+destination and whether it is taken, and a jump only the original performs must never be
+taken. Every other effect must happen on both sides in the same order, on equal operands
+and memory. The obligation compares every stack word, effect operand and the final memory,
+and the replacement may not read deeper, grow the stack higher or change its height.
+
+Of the 37 rules, 35 prove in 6,565 instances that share 74 theorems; two
+`ADDMOD` and `MULMOD` commutativity theorems have hand-written proofs. Two rules are
+listed in `EXCLUDED` by digest and reported as excluded, never as proved:
+`PUSH x MSTORE PUSH x MLOAD -> DUP1 PUSH x MSTORE` needs one more stack word than the
+code it replaces, so it can overflow a stack that the original fits, and
+`noop_stack_suffix` matches unboundedly many sequences, which would need a general
+stack-machine theorem. The rules prove in 19 seconds of wall time with four jobs. Gas,
+memory expansion, metadata, the Rust extractors, edits and the evaluator stay trusted.
 
 ## Discovering candidates
 
